@@ -107,14 +107,16 @@ body{
 }
 .nav-ico{ width:15px; text-align:center; font-family:var(--font-mono); font-size:12px; opacity:.85;}
 .sidebar-foot{ padding:14px; border-top:1px solid var(--blue-line); }
+.upload-row{ display:flex; gap:6px; }
 .upload-btn{
-  width:100%; background:var(--blue-card); border:1px dashed var(--cyan-dim);
+  flex:1; background:var(--blue-card); border:1px dashed var(--cyan-dim);
   color:var(--cyan); font-family:var(--font-mono); font-size:11px; font-weight:600;
   padding:10px 8px; border-radius:6px; cursor:pointer; letter-spacing:.03em;
   display:flex; align-items:center; justify-content:center; gap:6px;
   transition:background .15s, border-color .15s;
 }
 .upload-btn:hover{ background:rgba(95,199,222,0.09); border-color:var(--cyan); }
+#cloud-refresh-btn{ width:36px; height:auto; flex-shrink:0; }
 .file-status{ font-family:var(--font-mono); font-size:9.5px; color:var(--ink-faint); margin-top:8px; line-height:1.5; }
 .file-status b{ color:var(--green); }
 
@@ -430,7 +432,10 @@ select{
       <button class="nav-btn" data-tab="interim"><span class="nav-ico">Ⅴ</span>Interim Payments</button>
     </nav>
     <div class="sidebar-foot">
-      <button class="upload-btn" id="upload-trigger">⭱ Upload Updated Excel</button>
+      <div class="upload-row">
+        <button class="upload-btn" id="upload-trigger">⭱ Upload Updated Excel</button>
+        <button class="icon-btn" id="cloud-refresh-btn" title="Check for a newer upload from another device">↻</button>
+      </div>
       <input type="file" id="file-input" accept=".xlsx,.xls">
       <div class="file-status" id="file-status">Loaded: <b>bundled dataset</b><br>431 project records</div>
     </div>
@@ -1453,13 +1458,15 @@ function showToast(msg, isError){
 
 /* ============ Excel upload / re-parse ============ */
 const STORAGE_KEY = 'siteCostDashboard_v1';
+const FIREBASE_DB_URL = 'https://site-cost-dashboard-default-rtdb.asia-southeast1.firebasedatabase.app';
+const CLOUD_NODE = '/dashboard.json';
 
 function saveToStorage(fileName){
   try{
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ data: DATA, fileName, savedAt: Date.now() }));
     return true;
   }catch(err){
-    console.warn('Could not persist data locally:', err);
+    console.warn('Could not cache data locally:', err);
     return false;
   }
 }
@@ -1469,19 +1476,52 @@ function loadFromStorage(){
     if(!raw) return null;
     return JSON.parse(raw);
   }catch(err){
-    console.warn('Could not read persisted data:', err);
+    console.warn('Could not read cached data:', err);
     return null;
   }
 }
 function clearStorage(){
   try{ localStorage.removeItem(STORAGE_KEY); }catch(err){}
 }
-function setFileStatus(fileName, count, persisted){
+
+async function fetchCloudData(){
+  try{
+    const res = await fetch(FIREBASE_DB_URL + CLOUD_NODE, { cache:'no-store' });
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const json = await res.json();
+    if(json && json.data) return json;
+    return null;
+  }catch(err){
+    console.warn('Cloud fetch failed:', err);
+    return null;
+  }
+}
+async function pushCloudData(fileName){
+  try{
+    const payload = { data: DATA, fileName, savedAt: Date.now() };
+    const res = await fetch(FIREBASE_DB_URL + CLOUD_NODE, {
+      method:'PUT',
+      headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    return true;
+  }catch(err){
+    console.warn('Cloud sync failed:', err);
+    return false;
+  }
+}
+
+function setFileStatus(fileName, count, mode){
+  // mode: 'cloud' | 'local' | 'none'
   const el = document.getElementById('file-status');
-  const persistLine = persisted
-    ? `<br><span style="color:var(--cyan)">frozen — stays after refresh</span> <a href="#" id="reset-data-link" style="color:var(--ink-faint); text-decoration:underline; margin-left:6px;">reset</a>`
-    : '';
-  el.innerHTML = `Loaded: <b>${fileName}</b><br>${count} project records${persistLine}`;
+  let line = '';
+  if(mode === 'cloud'){
+    line = `<br><span style="color:var(--cyan)">☁ synced — visible on every device</span> <a href="#" id="reset-data-link" style="color:var(--ink-faint); text-decoration:underline; margin-left:6px;">show sample</a>`;
+  } else if(mode === 'local'){
+    line = `<br><span style="color:var(--amber)">saved on this device only</span> <a href="#" id="reset-data-link" style="color:var(--ink-faint); text-decoration:underline; margin-left:6px;">show sample</a>`;
+  }
+  el.innerHTML = `Loaded: <b>${fileName}</b><br>${count} project records${line}`;
   const resetLink = document.getElementById('reset-data-link');
   if(resetLink){
     resetLink.addEventListener('click', (e)=>{
@@ -1489,8 +1529,8 @@ function setFileStatus(fileName, count, persisted){
       clearStorage();
       DATA = JSON.parse(JSON.stringify(DEFAULT_DATA));
       renderAll();
-      setFileStatus('bundled dataset', DATA.detail.length, false);
-      showToast('Cleared saved upload — showing bundled sample data.');
+      setFileStatus('bundled dataset', DATA.detail.length, 'none');
+      showToast('Showing bundled sample data on this device (cloud data is unchanged).');
     });
   }
 }
@@ -1506,9 +1546,17 @@ document.getElementById('file-input').addEventListener('change', (e)=>{
       const parsed = parseWorkbook(wb);
       DATA = parsed;
       renderAll();
-      const persisted = saveToStorage(file.name);
-      setFileStatus(file.name, DATA.detail.length, persisted);
-      showToast(persisted ? 'Dashboard refreshed and saved from ' + file.name : 'Dashboard refreshed from ' + file.name + ' (not saved locally)');
+      saveToStorage(file.name);
+      setFileStatus(file.name, DATA.detail.length, 'local');
+      showToast('Refreshed from ' + file.name + ' — syncing to cloud…');
+      pushCloudData(file.name).then(ok=>{
+        if(ok){
+          setFileStatus(file.name, DATA.detail.length, 'cloud');
+          showToast('Synced to cloud — every device will now see ' + file.name);
+        } else {
+          showToast('Could not reach the cloud database — this device is up to date, but others won\'t see it yet. Try the ↻ button later.', true);
+        }
+      });
     }catch(err){
       console.error(err);
       showToast('Could not parse file — check it matches the template sheet layout.', true);
@@ -1517,12 +1565,44 @@ document.getElementById('file-input').addEventListener('change', (e)=>{
   reader.readAsArrayBuffer(file);
 });
 
-/* Load any previously saved upload on page start, so results stay frozen across visits */
-(function restorePersistedData(){
+document.getElementById('cloud-refresh-btn').addEventListener('click', async ()=>{
+  const btn = document.getElementById('cloud-refresh-btn');
+  btn.disabled = true;
+  const cloud = await fetchCloudData();
+  btn.disabled = false;
+  if(cloud && cloud.data){
+    DATA = cloud.data;
+    saveToStorage(cloud.fileName || 'cloud data');
+    renderAll();
+    setFileStatus(cloud.fileName || 'cloud data', DATA.detail.length, 'cloud');
+    showToast('Checked the cloud — showing the latest upload.');
+  } else {
+    showToast('No newer cloud data found (or the cloud database is unreachable).', true);
+  }
+});
+
+/* On page start: paint immediately so the page is never blank, then upgrade to the shared cloud copy
+   (falling back to this device's local cache, then the bundled sample, if the cloud is unreachable) */
+(async function initData(){
+  renderAll();
+  setFileStatus('bundled dataset', DATA.detail.length, 'none');
+  document.getElementById('file-status').innerHTML += '<br><span style="color:var(--ink-faint);">☁ checking for shared data…</span>';
+
+  const cloud = await fetchCloudData();
+  if(cloud && cloud.data){
+    DATA = cloud.data;
+    saveToStorage(cloud.fileName || 'cloud data');
+    renderAll();
+    setFileStatus(cloud.fileName || 'cloud data', DATA.detail.length, 'cloud');
+    return;
+  }
   const saved = loadFromStorage();
   if(saved && saved.data){
     DATA = saved.data;
-    setFileStatus(saved.fileName || 'saved upload', DATA.detail.length, true);
+    renderAll();
+    setFileStatus(saved.fileName || 'saved upload', DATA.detail.length, 'local');
+  } else {
+    setFileStatus('bundled dataset', DATA.detail.length, 'none');
   }
 })();
 
@@ -1682,7 +1762,7 @@ function parseWorkbook(wb){
 }
 
 /* ============ Init ============ */
-renderAll();
+/* Initial render is triggered by initData() above, once cloud/local data has resolved. */
 </script>
 </body>
 </html>
